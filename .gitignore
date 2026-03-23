@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+checkpoints/
+artifacts/
+training_output.log
+.claude/
