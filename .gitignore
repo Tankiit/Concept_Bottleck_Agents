@@ -6,3 +6,4 @@ artifacts/
 training_output.log
 .claude/
 checkpoints_text/
+*.md
