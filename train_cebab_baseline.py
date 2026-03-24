@@ -47,6 +47,11 @@ def main():
     p.add_argument("--freeze_backbone", action="store_true", help="Freeze transformer and train only classifier head")
     p.add_argument("--train_last_k", type=int, default=0, help="Unfreeze last K transformer layers (overrides freeze when >0)")
     p.add_argument("--amp", action="store_true", help="Enable AMP (CUDA preferred; experimental on MPS)")
+    # LoRA options
+    p.add_argument("--lora", action="store_true", help="Enable LoRA adapters on attention proj layers")
+    p.add_argument("--lora_rank", type=int, default=8)
+    p.add_argument("--lora_alpha", type=float, default=16.0)
+    p.add_argument("--lora_targets", type=str, default="qv", help="Which attention linears to adapt: qv|qkv|all")
     args = p.parse_args()
 
     prefer = args.device or ("cuda" if args.gpu else None)
@@ -80,7 +85,56 @@ def main():
         model = DistilBertForSequenceClassification.from_pretrained(
             "distilbert-base-uncased", num_labels=3
         )
+    # --- LoRA injection (manual, no external deps) ---
     model.to(device)
+
+    # --- LoRA injection (manual, no external deps) ---
+    class LoRALinear(nn.Module):
+        def __init__(self, base: nn.Linear, r: int, alpha: float):
+            super().__init__()
+            self.base = base
+            for p in self.base.parameters():
+                p.requires_grad = False
+            in_f, out_f = base.in_features, base.out_features
+            self.r = r
+            self.scale = alpha / max(1, r)
+            # A: in->r (init Kaiming), B: r->out (zeros so initial delta=0)
+            self.lora_A = nn.Linear(in_f, r, bias=False)
+            self.lora_B = nn.Linear(r, out_f, bias=False)
+            nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+            nn.init.zeros_(self.lora_B.weight)
+
+        def forward(self, x):
+            return self.base(x) + self.scale * self.lora_B(self.lora_A(x))
+
+    def replace_module(parent, name: str, new_module: nn.Module):
+        setattr(parent, name, new_module)
+
+    def iter_parent_modules(model: nn.Module):
+        for name, module in model.named_modules():
+            for child_name, child in module.named_children():
+                yield module, child_name, child, f"{name}.{child_name}" if name else child_name
+
+    import math
+    lora_applied = 0
+    if args.lora:
+        targets = args.lora_targets.lower()
+        def want(name: str) -> bool:
+            if targets == "qv":
+                return name.endswith("q_lin") or name.endswith("v_lin")
+            if targets == "qkv":
+                return name.endswith("q_lin") or name.endswith("k_lin") or name.endswith("v_lin")
+            return name.endswith("q_lin") or name.endswith("k_lin") or name.endswith("v_lin") or name.endswith("out_lin")
+
+        for parent, child_name, child, fqname in iter_parent_modules(model):
+            if isinstance(child, nn.Linear) and want(child_name) and \
+               ("distilbert.transformer.layer" in fqname and ".attention." in fqname):
+                lora = LoRALinear(child, r=args.lora_rank, alpha=args.lora_alpha)
+                replace_module(parent, child_name, lora)
+                lora_applied += 1
+        print(f"LoRA applied to {lora_applied} attention linears (rank={args.lora_rank}, alpha={args.lora_alpha}).")
+        # Move new parameters to device
+        model.to(device)
 
     # Optionally freeze backbone / unfreeze last K layers
     if args.freeze_backbone and args.train_last_k <= 0:
@@ -104,12 +158,19 @@ def main():
         else:
             print("Warning: could not access transformer layers for partial unfreeze.")
 
+    # If LoRA enabled, ensure only classifier and LoRA params are trainable unless overridden by train_last_k
+    if args.lora and args.train_last_k == 0 and not args.freeze_backbone:
+        for n, p in model.named_parameters():
+            if not (n.startswith("classifier") or ".lora_" in n):
+                p.requires_grad = False
+        print("Frozen backbone except classifier and LoRA params.")
+
     # Report trainable params
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     print(f"Trainable params: {trainable:,} / {total:,} ({100.0*trainable/total:.2f}%)")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="max", factor=0.5, patience=1, min_lr=1e-6
     )
