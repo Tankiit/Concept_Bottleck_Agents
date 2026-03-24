@@ -654,6 +654,12 @@ def train_stage2(
         weight_decay=cfg["stage2_wd"],
     )
     criterion = nn.CrossEntropyLoss()
+    # Use ReduceLROnPlateau on validation accuracy (mode=max)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", factor=0.1,
+        patience=cfg.get("stage1_patience", 5),
+        min_lr=cfg.get("stage1_min_lr", 1e-5),
+    )
 
     save_path    = os.path.join(cfg["checkpoint_dir"], "predictor_best.pth")
     best_val_acc = 0.0
@@ -668,6 +674,7 @@ def train_stage2(
         predictor.eval()
         with torch.no_grad():
             val_acc = (predictor(c_vl).argmax(1) == y_vl).float().mean().item()
+        scheduler.step(val_acc)
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
@@ -783,6 +790,28 @@ def save_bq_artifacts(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--device", choices=["cuda", "mps", "cpu"], help="Force compute device")
+    parser.add_argument("--gpu", action="store_true", help="Shortcut for --device cuda")
+    args = parser.parse_args()
+
+    # Resolve device preference
+    auto_device = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
+    requested = None
+    if args.device:
+        requested = args.device
+    elif args.gpu:
+        requested = "cuda"
+    if requested == "cuda" and not torch.cuda.is_available():
+        print("Requested CUDA but not available; falling back to auto device.")
+        requested = None
+    if requested == "mps" and not torch.backends.mps.is_available():
+        print("Requested MPS but not available; falling back to auto device.")
+        requested = None
+
+    CFG["device"] = requested or auto_device
+
     torch.manual_seed(CFG["seed"])
     np.random.seed(CFG["seed"])
     os.makedirs(CFG["checkpoint_dir"], exist_ok=True)
