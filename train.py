@@ -25,6 +25,13 @@ import torchvision.models as models
 from torch.utils.data import DataLoader
 from torch_concepts.data.datasets import cub as cub
 
+# Optional progress bars (no-op fallback if tqdm unavailable)
+try:
+    from tqdm import tqdm
+except Exception:  # pragma: no cover
+    def tqdm(x, *args, **kwargs):
+        return x
+
 # ── CEM CUB loader from torch_concepts ─────────────────────────────────────
 # Use the built-in CUB dataset from torch_concepts package
 from torch_concepts.data.datasets import cub as cub_module
@@ -79,14 +86,32 @@ def patched_init(self, split='train', uncertain_concept_labels=False, root='./CU
     with open(self.pkl_file_path, 'rb') as f:
         self.data = pickle.load(f)
 
-    # Process the data
+    # Process the data (apply path_transform once per item)
     processed_data = []
-    for item in self.data:
-        if path_transform:
-            item = dict(item)  # Make a copy
-            item['img_path'] = path_transform(item['img_path'])
-        processed_data.append(item)
-    self.data = processed_data
+    if path_transform:
+        for item in self.data:
+            it = dict(item)
+            it['img_path'] = path_transform(it['img_path'])
+            processed_data.append(it)
+        self.data = processed_data
+    else:
+        self.data = list(self.data)
+
+    # Build and cache transforms once (avoid per-sample Compose construction)
+    import torchvision.transforms as _T
+    self._train_transform = _T.Compose([
+        _T.RandomResizedCrop(_IMG_SIZE),
+        _T.RandomHorizontalFlip(),
+        _T.ColorJitter(brightness=0.2, contrast=0.2),
+        _T.ToTensor(),
+        _T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
+    self._eval_transform = _T.Compose([
+        _T.Resize(_IMG_SIZE),
+        _T.CenterCrop(_IMG_SIZE),
+        _T.ToTensor(),
+        _T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
 
 def identity_transform(x):
     """Default identity transform for dataset items."""
@@ -115,7 +140,6 @@ def patched_getitem(self, idx):
     """Get item, handling the concept index mismatch properly."""
     import numpy as np
     from PIL import Image
-    import torchvision.transforms as transforms
     import os
 
     # Get the raw data
@@ -130,24 +154,11 @@ def patched_getitem(self, idx):
         # Return a dummy black image if loading fails
         img = Image.new('RGB', (299, 299), (0, 0, 0))
 
-    # Apply transforms
+    # Apply cached transforms
     if self.training_augment and self.split == 'train':
-        # Basic training augmentation
-        transform = transforms.Compose([
-            transforms.RandomResizedCrop(299),
-            transforms.RandomHorizontalFlip(),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2),
-            transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-        ])
+        transform = self._train_transform
     else:
-        # Validation/test transform
-        transform = transforms.Compose([
-            transforms.Resize(299),
-            transforms.CenterCrop(299),
-            transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-        ])
+        transform = self._eval_transform
 
     img = self.sample_transform(img)
     img = transform(img)
@@ -202,6 +213,9 @@ CFG = dict(
     num_workers    = 4,          # parallel image loading (safe on Mac with spawn)
     checkpoint_dir = "./checkpoints",
     artifact_dir   = "./artifacts",
+    # Backbone/input
+    backbone       = os.environ.get("BACKBONE", "resnet50"),  # "resnet50" or "inception_v3"
+    input_size     = int(os.environ.get("INPUT_SIZE", 224)),  # 224 for ResNet, 299 for Inception
     # Stage 1: x → c
     # Phase A: freeze backbone, train heads only (fast warmup)
     stage1_warmup_epochs = 20,   # epochs with backbone frozen
@@ -226,6 +240,9 @@ CFG = dict(
     aux_loss_weight= 0.4,       # InceptionV3 auxiliary classifier weight
     seed           = 42,
 )
+
+# Global image size used by dataset transforms; updated from CFG on import
+_IMG_SIZE = CFG["input_size"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -330,42 +347,54 @@ class AnnotatedConceptHead(nn.Module):
 
 class ConceptEncoder(nn.Module):
     """
-    InceptionV3 backbone (ImageNet pretrained, fc replaced)
-    + annotated linear concept head.
+    Backbone (ResNet50 default, InceptionV3 optional) + annotated linear head.
 
-    Forward returns (main_logits, aux_logits) during training,
-    just main_logits during eval — matching InceptionV3 convention.
+    - ResNet50 (default): expects ~224 input, no aux branch.
+    - InceptionV3: expects 299 input, returns aux branch during training.
     """
-    def __init__(self, concept_names: list[str]):
+    def __init__(self, concept_names: list[str], backbone: str | None = None):
         super().__init__()
-        inc = models.inception_v3(pretrained=True, aux_logits=True)
-        d   = inc.fc.in_features                  # 2048
+        bname = backbone or CFG.get("backbone", "resnet50")
+        self._backbone_type = bname
 
-        # Replace both heads with identity so we get raw features
-        inc.fc            = nn.Identity()
-        inc.AuxLogits.fc  = nn.Identity()
-        self.backbone     = inc
+        if bname == "inception_v3":
+            inc = models.inception_v3(pretrained=True, aux_logits=True)
+            d   = inc.fc.in_features  # 2048
+            inc.fc           = nn.Identity()
+            inc.AuxLogits.fc = nn.Identity()
+            self.backbone    = inc
+            self.aux_head    = nn.Linear(768, len(concept_names))
+        elif bname == "resnet50":
+            try:
+                res = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
+            except Exception:
+                res = models.resnet50(pretrained=True)
+            d   = res.fc.in_features  # 2048
+            res.fc         = nn.Identity()
+            self.backbone  = res
+            self.aux_head  = None
+        else:
+            raise ValueError(f"Unsupported backbone: {bname}")
 
-        # Our concept head (annotated)
         self.concept_head = AnnotatedConceptHead(d, concept_names)
-        # Auxiliary concept head (same structure, separate params)
-        # Used only during training for InceptionV3 auxiliary loss
-        self.aux_head     = nn.Linear(768, len(concept_names))
-        # NOTE: InceptionV3 aux branch output dim is 768, not 2048
 
     def forward(self, x: torch.Tensor):
-        if self.training:
-            # InceptionV3 returns InceptionOutputs namedtuple
-            out      = self.backbone(x)
-            h_main   = out.logits         # (B, 2048)
-            h_aux    = out.aux_logits     # (B, 768)
-            return self.concept_head(h_main), self.aux_head(h_aux)
+        if self._backbone_type == "inception_v3":
+            if self.training:
+                out    = self.backbone(x)
+                h_main = out.logits
+                h_aux  = out.aux_logits
+                c_main = self.concept_head(h_main)
+                c_aux  = self.aux_head(h_aux) if self.aux_head is not None else None
+                return c_main, c_aux
+            else:
+                h = self.backbone(x)
+                return self.concept_head(h), None
         else:
-            h = self.backbone(x)          # (B, 2048) during eval
+            h = self.backbone(x)
             return self.concept_head(h), None
 
     def get_W_concepts(self) -> np.ndarray:
-        """Returns W_concepts: (112, 2048) for BQ."""
         return self.concept_head.weight.detach().cpu().numpy()
 
 
@@ -431,6 +460,9 @@ def train_stage1(
     ).to(device)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
+    # Enable AMP on CUDA for speed; MPS autocast kept conservative
+    use_cuda_amp = (device == "cuda")
+
     # Phase A: freeze backbone, only optimise heads
     print(f"  [Phase A] Freezing backbone for {warmup} warmup epochs ...")
     _set_backbone_trainable(encoder, False)
@@ -439,6 +471,11 @@ def train_stage1(
         lr=cfg["stage1_lr"],
         momentum=cfg["stage1_momentum"],
         weight_decay=cfg["stage1_wd"],
+    )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.1,
+        patience=cfg["stage1_patience"],
+        min_lr=cfg["stage1_min_lr"],
     )
 
     os.makedirs(cfg["checkpoint_dir"], exist_ok=True)
@@ -459,29 +496,48 @@ def train_stage1(
                 momentum=cfg["stage1_momentum"],
                 weight_decay=cfg["stage1_wd"],
             )
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode="min", factor=0.1,
+                patience=cfg["stage1_patience"],
+                min_lr=cfg["stage1_min_lr"],
+            )
             phase_b_done = True
 
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.1,
-            patience=cfg["stage1_patience"],
-            min_lr=cfg["stage1_min_lr"],
-        )
+        
 
         # ── Train
         encoder.train()
         train_loss = 0.0
         n_batches = 0
-        for imgs, concepts, _ in train_loader:
-            imgs, concepts = imgs.to(device), concepts.to(device)
-            optimizer.zero_grad()
+        iterator = tqdm(train_loader, desc=f"Train E{epoch+1}", leave=False)
+        for imgs, concepts, _ in iterator:
+            imgs = imgs.to(device, non_blocking=True)
+            concepts = concepts.to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
 
-            c_logits, c_aux = encoder(imgs)
-            loss = criterion(c_logits, concepts)
-            if c_aux is not None:
-                loss = loss + cfg["aux_loss_weight"] * criterion(c_aux, concepts)
+            if use_cuda_amp:
+                from torch.cuda.amp import autocast, GradScaler
+                scaler = locals().get("_scaler")
+                if scaler is None:
+                    scaler = GradScaler()
+                    globals().update({"_scaler": scaler})
+                with autocast():
+                    c_logits, c_aux = encoder(imgs)
+                    loss = criterion(c_logits, concepts)
+                    if c_aux is not None:
+                        loss = loss + cfg["aux_loss_weight"] * criterion(c_aux, concepts)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                # FP32 or MPS without grad scaling
+                c_logits, c_aux = encoder(imgs)
+                loss = criterion(c_logits, concepts)
+                if c_aux is not None:
+                    loss = loss + cfg["aux_loss_weight"] * criterion(c_aux, concepts)
+                loss.backward()
+                optimizer.step()
 
-            loss.backward()
-            optimizer.step()
             train_loss += loss.item()
             n_batches  += 1
         train_loss /= max(n_batches, 1)
@@ -490,8 +546,10 @@ def train_stage1(
         encoder.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for imgs, concepts, _ in val_loader:
-                imgs, concepts = imgs.to(device), concepts.to(device)
+            viter = tqdm(val_loader, desc=f"Val   E{epoch+1}", leave=False)
+            for imgs, concepts, _ in viter:
+                imgs = imgs.to(device, non_blocking=True)
+                concepts = concepts.to(device, non_blocking=True)
                 c_logits, _ = encoder(imgs)
                 val_loss   += criterion(c_logits, concepts).item()
         val_loss /= len(val_loader)
@@ -538,11 +596,22 @@ def extract_concept_scores(
     all_c, all_y = [], []
 
     with torch.no_grad():
-        for imgs, concepts, labels in dataloader:
-            c_logits, _ = encoder(imgs.to(device))
+        iterator = tqdm(dataloader, desc="Extract", leave=False)
+        # Lightweight autocast during inference on accelerators
+        use_cuda = device == "cuda"
+        try:
+            from torch.cuda.amp import autocast as _cuda_autocast
+        except Exception:
+            _cuda_autocast = None
+        for imgs, concepts, labels in iterator:
+            imgs = imgs.to(device, non_blocking=True)
+            if use_cuda and _cuda_autocast is not None:
+                with _cuda_autocast():
+                    c_logits, _ = encoder(imgs)
+            else:
+                c_logits, _ = encoder(imgs)
             all_c.append(torch.sigmoid(c_logits).cpu())
-            # CUB loader returns (img, concepts, label) but label may be
-            # a tensor or int — normalise
+            # Normalise label type
             if isinstance(labels, torch.Tensor):
                 all_y.append(labels)
             else:
@@ -589,7 +658,7 @@ def train_stage2(
     save_path    = os.path.join(cfg["checkpoint_dir"], "predictor_best.pth")
     best_val_acc = 0.0
 
-    for epoch in range(cfg["stage2_epochs"]):
+    for epoch in tqdm(range(cfg["stage2_epochs"]), desc="Stage2", leave=False):
         predictor.train()
         optimizer.zero_grad()
         loss = criterion(predictor(c_tr), y_tr)
@@ -622,8 +691,9 @@ def evaluate_concept_accuracy(
     encoder.eval()
     correct, total = 0, 0
     with torch.no_grad():
-        for imgs, concepts, _ in loader:
-            preds = torch.sigmoid(encoder(imgs.to(device))[0]) > 0.5
+        iterator = tqdm(loader, desc="Concept Acc", leave=False)
+        for imgs, concepts, _ in iterator:
+            preds = torch.sigmoid(encoder(imgs.to(device, non_blocking=True))[0]) > 0.5
             correct += (preds.cpu() == concepts.bool()).sum().item()
             total   += concepts.numel()
     return correct / total
@@ -716,6 +786,16 @@ def main():
     torch.manual_seed(CFG["seed"])
     np.random.seed(CFG["seed"])
     os.makedirs(CFG["checkpoint_dir"], exist_ok=True)
+
+    # Backend perf knobs
+    if CFG["device"] == "cuda":
+        torch.backends.cudnn.benchmark = True
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+
+    print(f"Backbone: {CFG['backbone']}  | Input size: {CFG['input_size']}  | Device: {CFG['device']}")
 
     # ── Concept names (112, ordered to match pkl attribute_label vectors)
     concept_names = get_concept_names()
