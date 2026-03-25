@@ -4,8 +4,9 @@ import time
 from pathlib import Path
 import torch
 from torch import nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
+import numpy as np
 
 from text_cache_loader import load_text_dataset_cached
 
@@ -23,18 +24,89 @@ def pick_device(prefer: str | None = None) -> str:
     return "cpu"
 
 
-def to_device(batch, device: str):
-    # batch is a tuple from TensorDataset:
-    # (input_ids, attention_mask, labels, [concept_labels], [is_unknown])
-    input_ids = batch[0].to(device, non_blocking=True)
-    attention_mask = batch[1].to(device, non_blocking=True)
-    labels = batch[2].to(device, non_blocking=True)
-    return input_ids, attention_mask, labels
+def load_latent_cache(latent_cache_dir: str, batch_size: int = 16):
+    """
+    Load pre-computed embeddings from latent_cache directory.
+
+    Expects files named like:
+    - cebab_low_rank_rank128_svd_train_latents.npy
+    - cebab_low_rank_rank128_svd_train_labels.npy
+    - cebab_low_rank_rank128_svd_train_concepts.npy (optional)
+    - cebab_low_rank_rank128_svd_train_is_unknown.npy (optional)
+    And similar for val and test splits.
+    """
+    latent_cache_dir = Path(latent_cache_dir)
+
+    # Find the CEBaB latent files
+    pattern = "cebab_low_rank_rank128_svd"  # As seen in the cache directory
+
+    def load_split(split: str):
+        latents = np.load(latent_cache_dir / f"{pattern}_{split}_latents.npy")
+        labels = np.load(latent_cache_dir / f"{pattern}_{split}_labels.npy")
+
+        # Load optional files
+        concepts_path = latent_cache_dir / f"{pattern}_{split}_concepts.npy"
+        unknown_path = latent_cache_dir / f"{pattern}_{split}_is_unknown.npy"
+
+        # Convert to tensors
+        latents_tensor = torch.from_numpy(latents).float()
+        labels_tensor = torch.from_numpy(labels).long()
+
+        tensors = [latents_tensor, labels_tensor]
+
+        # Load concepts and unknown flags if available
+        if concepts_path.exists():
+            concepts = np.load(concepts_path)
+            tensors.append(torch.from_numpy(concepts).long())
+        if unknown_path.exists():
+            unknown = np.load(unknown_path)
+            tensors.append(torch.from_numpy(unknown).float())
+
+        return TensorDataset(*tensors)
+
+    train_ds = load_split("train")
+    val_ds = load_split("val")
+    test_ds = load_split("test")
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+
+    # Load metadata
+    metadata_path = latent_cache_dir / f"{pattern}_metadata.json"
+    metadata = {}
+    if metadata_path.exists():
+        import json
+        with open(metadata_path) as f:
+            metadata = json.load(f)
+
+    return train_loader, val_loader, test_loader, metadata
+
+
+def to_device(batch, device: str, use_latent: bool = False):
+    """
+    Move batch to device.
+
+    For latent mode: batch is (latents, labels, [concepts], [is_unknown])
+    For text mode: batch is (input_ids, attention_mask, labels, [concepts], [is_unknown])
+    """
+    if use_latent:
+        latents = batch[0].to(device, non_blocking=True)
+        labels = batch[1].to(device, non_blocking=True)
+        return latents, labels
+    else:
+        input_ids = batch[0].to(device, non_blocking=True)
+        attention_mask = batch[1].to(device, non_blocking=True)
+        labels = batch[2].to(device, non_blocking=True)
+        return input_ids, attention_mask, labels
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--cache_dir", type=str, default="/Users/tanmoy/research/Credal_Sets/Wasserstein/data_cache")
+    p.add_argument("--latent_cache_dir", type=str, default="/Users/tanmoy/research/Credal_Sets/Wasserstein/latent_cache/bert_cebab",
+                   help="Path to latent cache with pre-computed embeddings")
+    p.add_argument("--use_latent_cache", action="store_true", help="Use pre-computed embeddings from latent_cache_dir")
     p.add_argument("--tokenizer", type=str, default="distilbert-base-uncased")
     p.add_argument("--max_length", type=int, default=128)
     p.add_argument("--batch_size", type=int, default=16)
@@ -57,113 +129,141 @@ def main():
     prefer = args.device or ("cuda" if args.gpu else None)
     device = pick_device(prefer)
 
-    # Load cached loaders
-    tl, vl, te, _, meta = load_text_dataset_cached(
-        dataset_name="cebab",
-        cache_dir=args.cache_dir,
-        tokenizer_name=args.tokenizer,
-        max_length=args.max_length,
-        batch_size=args.batch_size,
-        num_workers=0,
-    )
+    # Load cached loaders (text or latent)
+    if args.use_latent_cache:
+        print(f"Loading pre-computed embeddings from: {args.latent_cache_dir}")
+        tl, vl, te, meta = load_latent_cache(
+            latent_cache_dir=args.latent_cache_dir,
+            batch_size=args.batch_size,
+        )
+        latent_dim = 128  # Low-rank SVD rank
+        print(f"Using latent cache: {meta.get('extraction_config', {}) if meta else 'No metadata'}")
+    else:
+        tl, vl, te, _, meta = load_text_dataset_cached(
+            dataset_name="cebab",
+            cache_dir=args.cache_dir,
+            tokenizer_name=args.tokenizer,
+            max_length=args.max_length,
+            batch_size=args.batch_size,
+            num_workers=0,
+        )
+        print(f"Using text cache: {meta}")
 
-    print(f"Using cache: {meta}")
     print(f"Device: {device}")
     train_size = len(tl.dataset)
     val_size = len(vl.dataset)
     test_size = len(te.dataset)
     print(f"Sizes: train={train_size}, val={val_size}, test={test_size}, batch_size={args.batch_size}")
 
-    # Model: DistilBERT (3-way classification)
-    from transformers import DistilBertForSequenceClassification
-    try:
-        model = DistilBertForSequenceClassification.from_pretrained(
-            args.tokenizer, num_labels=3
+    # Model: DistilBERT for text or simple MLP for latent embeddings
+    if args.use_latent_cache:
+        # Simple MLP classifier for pre-computed embeddings
+        model = nn.Sequential(
+            nn.Linear(latent_dim, 256),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, 3)
         )
-    except Exception:
-        # Fallback to base model name if tokenizer is different
-        model = DistilBertForSequenceClassification.from_pretrained(
-            "distilbert-base-uncased", num_labels=3
-        )
-    # --- LoRA injection (manual, no external deps) ---
+        print("Using MLP classifier on frozen embeddings")
+    else:
+        # Full DistilBERT for text
+        from transformers import DistilBertForSequenceClassification
+        try:
+            model = DistilBertForSequenceClassification.from_pretrained(
+                args.tokenizer, num_labels=3
+            )
+        except Exception:
+            # Fallback to base model name if tokenizer is different
+            model = DistilBertForSequenceClassification.from_pretrained(
+                "distilbert-base-uncased", num_labels=3
+            )
+        print("Using DistilBERT for text classification")
     model.to(device)
 
-    # --- LoRA injection (manual, no external deps) ---
-    class LoRALinear(nn.Module):
-        def __init__(self, base: nn.Linear, r: int, alpha: float):
-            super().__init__()
-            self.base = base
-            for p in self.base.parameters():
-                p.requires_grad = False
-            in_f, out_f = base.in_features, base.out_features
-            self.r = r
-            self.scale = alpha / max(1, r)
-            # A: in->r (init Kaiming), B: r->out (zeros so initial delta=0)
-            self.lora_A = nn.Linear(in_f, r, bias=False)
-            self.lora_B = nn.Linear(r, out_f, bias=False)
-            nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
-            nn.init.zeros_(self.lora_B.weight)
+    # Skip LoRA and BERT-specific options when using latent cache
+    if args.use_latent_cache:
+        if args.lora or args.freeze_backbone or args.train_last_k > 0:
+            print("Warning: --lora, --freeze_backbone, --train_last_k are ignored when using latent cache")
+    else:
+        # --- LoRA injection (manual, no external deps) ---
+        class LoRALinear(nn.Module):
+            def __init__(self, base: nn.Linear, r: int, alpha: float):
+                super().__init__()
+                self.base = base
+                for p in self.base.parameters():
+                    p.requires_grad = False
+                in_f, out_f = base.in_features, base.out_features
+                self.r = r
+                self.scale = alpha / max(1, r)
+                # A: in->r (init Kaiming), B: r->out (zeros so initial delta=0)
+                self.lora_A = nn.Linear(in_f, r, bias=False)
+                self.lora_B = nn.Linear(r, out_f, bias=False)
+                nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+                nn.init.zeros_(self.lora_B.weight)
 
-        def forward(self, x):
-            return self.base(x) + self.scale * self.lora_B(self.lora_A(x))
+            def forward(self, x):
+                return self.base(x) + self.scale * self.lora_B(self.lora_A(x))
 
-    def replace_module(parent, name: str, new_module: nn.Module):
-        setattr(parent, name, new_module)
+        def replace_module(parent, name: str, new_module: nn.Module):
+            setattr(parent, name, new_module)
 
-    def iter_parent_modules(model: nn.Module):
-        for name, module in model.named_modules():
-            for child_name, child in module.named_children():
-                yield module, child_name, child, f"{name}.{child_name}" if name else child_name
+        def iter_parent_modules(model: nn.Module):
+            for name, module in model.named_modules():
+                for child_name, child in module.named_children():
+                    yield module, child_name, child, f"{name}.{child_name}" if name else child_name
 
-    import math
-    lora_applied = 0
-    if args.lora:
-        targets = args.lora_targets.lower()
-        def want(name: str) -> bool:
-            if targets == "qv":
-                return name.endswith("q_lin") or name.endswith("v_lin")
-            if targets == "qkv":
-                return name.endswith("q_lin") or name.endswith("k_lin") or name.endswith("v_lin")
-            return name.endswith("q_lin") or name.endswith("k_lin") or name.endswith("v_lin") or name.endswith("out_lin")
+        import math
+        lora_applied = 0
+        if args.lora:
+            targets = args.lora_targets.lower()
+            def want(name: str) -> bool:
+                if targets == "qv":
+                    return name.endswith("q_lin") or name.endswith("v_lin")
+                if targets == "qkv":
+                    return name.endswith("q_lin") or name.endswith("k_lin") or name.endswith("v_lin")
+                return name.endswith("q_lin") or name.endswith("k_lin") or name.endswith("v_lin") or name.endswith("out_lin")
 
-        for parent, child_name, child, fqname in iter_parent_modules(model):
-            if isinstance(child, nn.Linear) and want(child_name) and \
-               ("distilbert.transformer.layer" in fqname and ".attention." in fqname):
-                lora = LoRALinear(child, r=args.lora_rank, alpha=args.lora_alpha)
-                replace_module(parent, child_name, lora)
-                lora_applied += 1
-        print(f"LoRA applied to {lora_applied} attention linears (rank={args.lora_rank}, alpha={args.lora_alpha}).")
-        # Move new parameters to device
-        model.to(device)
+            for parent, child_name, child, fqname in iter_parent_modules(model):
+                if isinstance(child, nn.Linear) and want(child_name) and \
+                   ("distilbert.transformer.layer" in fqname and ".attention." in fqname):
+                    lora = LoRALinear(child, r=args.lora_rank, alpha=args.lora_alpha)
+                    replace_module(parent, child_name, lora)
+                    lora_applied += 1
+            print(f"LoRA applied to {lora_applied} attention linears (rank={args.lora_rank}, alpha={args.lora_alpha}).")
+            # Move new parameters to device
+            model.to(device)
 
-    # Optionally freeze backbone / unfreeze last K layers
-    if args.freeze_backbone and args.train_last_k <= 0:
-        for n, p in model.named_parameters():
-            if not n.startswith("classifier"):
-                p.requires_grad = False
-        print("Backbone frozen; training classifier head only.")
-    if args.train_last_k > 0:
-        # First freeze all except classifier
-        for n, p in model.named_parameters():
-            if not n.startswith("classifier"):
-                p.requires_grad = False
-        # Then unfreeze last K transformer layers
-        k = args.train_last_k
-        layers = getattr(model.distilbert.transformer, "layer", [])
-        if layers:
-            for i in range(max(0, len(layers)-k), len(layers)):
-                for p in layers[i].parameters():
-                    p.requires_grad = True
-            print(f"Unfrozen last {k} transformer layers.")
-        else:
-            print("Warning: could not access transformer layers for partial unfreeze.")
+        # Optionally freeze backbone / unfreeze last K layers
+        if args.freeze_backbone and args.train_last_k <= 0:
+            for n, p in model.named_parameters():
+                if not n.startswith("classifier"):
+                    p.requires_grad = False
+            print("Backbone frozen; training classifier head only.")
+        if args.train_last_k > 0:
+            # First freeze all except classifier
+            for n, p in model.named_parameters():
+                if not n.startswith("classifier"):
+                    p.requires_grad = False
+            # Then unfreeze last K transformer layers
+            k = args.train_last_k
+            layers = getattr(model.distilbert.transformer, "layer", [])
+            if layers:
+                for i in range(max(0, len(layers)-k), len(layers)):
+                    for p in layers[i].parameters():
+                        p.requires_grad = True
+                print(f"Unfrozen last {k} transformer layers.")
+            else:
+                print("Warning: could not access transformer layers for partial unfreeze.")
 
-    # If LoRA enabled, ensure only classifier and LoRA params are trainable unless overridden by train_last_k
-    if args.lora and args.train_last_k == 0 and not args.freeze_backbone:
-        for n, p in model.named_parameters():
-            if not (n.startswith("classifier") or ".lora_" in n):
-                p.requires_grad = False
-        print("Frozen backbone except classifier and LoRA params.")
+        # If LoRA enabled, ensure only classifier and LoRA params are trainable unless overridden by train_last_k
+        if args.lora and args.train_last_k == 0 and not args.freeze_backbone:
+            for n, p in model.named_parameters():
+                if not (n.startswith("classifier") or ".lora_" in n):
+                    p.requires_grad = False
+            print("Frozen backbone except classifier and LoRA params.")
 
     # Report trainable params
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -194,25 +294,44 @@ def main():
             from torch.amp import autocast
 
         for batch in tqdm(tl, desc=f"Train E{epoch}", leave=False):
-            input_ids, attention_mask, labels = to_device(batch, device)
+            batch_data = to_device(batch, device, use_latent=args.use_latent_cache)
             optimizer.zero_grad(set_to_none=True)
+
+            if args.use_latent_cache:
+                # Latent mode: batch_data is (latents, labels)
+                latents, labels = batch_data
+                logits = model(latents)
+                loss = nn.functional.cross_entropy(logits, labels)
+            else:
+                # Text mode: batch_data is (input_ids, attention_mask, labels)
+                input_ids, attention_mask, labels = batch_data
+
             if use_amp and device == "cuda":
                 with autocast():
-                    out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                    loss = out.loss
+                    if args.use_latent_cache:
+                        loss = nn.functional.cross_entropy(model(latents), labels)
+                    else:
+                        out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                        loss = out.loss
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
             elif use_amp and device == "mps":
                 # Experimental: MPS autocast may not accelerate all ops
                 with autocast(device_type="mps", dtype=torch.float16):
-                    out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                    loss = out.loss
+                    if args.use_latent_cache:
+                        loss = nn.functional.cross_entropy(model(latents), labels)
+                    else:
+                        out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                        loss = out.loss
                 loss.backward()
                 optimizer.step()
             else:
-                out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                loss = out.loss
+                if args.use_latent_cache:
+                    loss = nn.functional.cross_entropy(model(latents), labels)
+                else:
+                    out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                    loss = out.loss
                 loss.backward()
                 optimizer.step()
             running_loss += float(loss.detach().cpu())
@@ -229,14 +348,24 @@ def main():
         with torch.no_grad():
             v0 = time.time()
             for batch in tqdm(vl, desc=f"Val   E{epoch}", leave=False):
-                input_ids, attention_mask, labels = to_device(batch, device)
-                out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                logits = out.logits
-                vloss += float(out.loss.detach().cpu())
-                preds = logits.argmax(dim=1)
+                batch_data = to_device(batch, device, use_latent=args.use_latent_cache)
+
+                if args.use_latent_cache:
+                    latents, labels = batch_data
+                    logits = model(latents)
+                    loss = nn.functional.cross_entropy(logits, labels, reduction='sum')
+                    vloss += float(loss)
+                    preds = logits.argmax(dim=1)
+                else:
+                    input_ids, attention_mask, labels = batch_data
+                    out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                    logits = out.logits
+                    vloss += float(out.loss.detach().cpu() * labels.numel())  # Scale to match sum reduction
+                    preds = logits.argmax(dim=1)
+
                 correct += (preds == labels).sum().item()
                 total += labels.numel()
-        val_loss = vloss / max(1, len(vl))
+        val_loss = vloss / max(1, total)  # Average per sample
         val_acc = correct / max(1, total)
         scheduler.step(val_acc)
 
@@ -267,8 +396,15 @@ def main():
     total = 0
     with torch.no_grad():
         for batch in tqdm(te, desc="Test", leave=False):
-            input_ids, attention_mask, labels = to_device(batch, device)
-            logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+            batch_data = to_device(batch, device, use_latent=args.use_latent_cache)
+
+            if args.use_latent_cache:
+                latents, labels = batch_data
+                logits = model(latents)
+            else:
+                input_ids, attention_mask, labels = batch_data
+                logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+
             preds = logits.argmax(dim=1)
             correct += (preds == labels).sum().item()
             total += labels.numel()
