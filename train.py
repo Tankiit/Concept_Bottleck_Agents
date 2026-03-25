@@ -4,6 +4,9 @@
 # Trains Koh et al. independent CBM on CUB-200-2011
 # using the CEM CUB loader + PyC concept layer.
 #
+# Fast training: Uses ResNet18 (light) by default for quick iteration.
+#                Set BACKBONE=resnet50 for higher accuracy.
+#
 # Produces after training:
 #   checkpoints/encoder_best.pth
 #   checkpoints/predictor_best.pth
@@ -195,13 +198,16 @@ cub_module.CUBDataset.__getitem__ = patched_getitem
 CUBDataset = cub_module.CUBDataset
 
 # ── PyC (optional — falls back gracefully) ────────────────────────────────────
+import warnings
 try:
-    import torch_concepts as pyc
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=FutureWarning)
+        import torch_concepts as pyc
     PYC_AVAILABLE = True
-    print("pytorch-concepts available — using LinearConceptLayer")
+    print("pytorch-concepts available")
 except ImportError:
     PYC_AVAILABLE = False
-    print("pytorch-concepts not found — using annotated nn.Linear fallback")
+    print("pytorch-concepts not found — using standard nn.Linear")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -214,19 +220,21 @@ CFG = dict(
     checkpoint_dir = "./checkpoints",
     artifact_dir   = "./artifacts",
     # Backbone/input
-    backbone       = os.environ.get("BACKBONE", "resnet50"),  # "resnet50" or "inception_v3"
+    backbone       = os.environ.get("BACKBONE", "resnet18"),  # "resnet18" (fast), "resnet50", "inception_v3"
     input_size     = int(os.environ.get("INPUT_SIZE", 224)),  # 224 for ResNet, 299 for Inception
     # Stage 1: x → c
     # Phase A: freeze backbone, train heads only (fast warmup)
     stage1_warmup_epochs = 20,   # epochs with backbone frozen
     # Phase B: full fine-tune backbone + heads
     stage1_epochs  = 100,        # max total epochs (incl. warmup); early-stop kicks in
-    stage1_lr      = 0.01,
+    # Backbone-specific LR (smaller models = higher LR for faster convergence)
+    stage1_lr      = {"resnet18": 0.02, "resnet50": 0.01, "inception_v3": 0.01},
     stage1_wd      = 4e-5,
     stage1_momentum= 0.9,
     stage1_patience= 5,          # ReduceLROnPlateau patience
     stage1_min_lr  = 1e-5,
     stage1_early_stop = 15,      # stop if val loss hasn't improved for N epochs
+    save_freq      = 5,          # save checkpoint every N epochs
     # Stage 2: c → y
     stage2_epochs  = 100,
     stage2_lr      = 0.01,
@@ -347,14 +355,15 @@ class AnnotatedConceptHead(nn.Module):
 
 class ConceptEncoder(nn.Module):
     """
-    Backbone (ResNet50 default, InceptionV3 optional) + annotated linear head.
+    Backbone (ResNet18/ResNet50/InceptionV3) + annotated linear head.
 
-    - ResNet50 (default): expects ~224 input, no aux branch.
-    - InceptionV3: expects 299 input, returns aux branch during training.
+    - ResNet18 (light, fast): expects ~224 input, no aux branch. ~11M params.
+    - ResNet50 (standard): expects ~224 input, no aux branch. ~25M params.
+    - InceptionV3 (heavy): expects 299 input, returns aux branch during training.
     """
     def __init__(self, concept_names: list[str], backbone: str | None = None):
         super().__init__()
-        bname = backbone or CFG.get("backbone", "resnet50")
+        bname = backbone or CFG.get("backbone", "resnet18")
         self._backbone_type = bname
 
         if bname == "inception_v3":
@@ -364,6 +373,15 @@ class ConceptEncoder(nn.Module):
             inc.AuxLogits.fc = nn.Identity()
             self.backbone    = inc
             self.aux_head    = nn.Linear(768, len(concept_names))
+        elif bname == "resnet18":
+            try:
+                res = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+            except Exception:
+                res = models.resnet18(pretrained=True)
+            d   = res.fc.in_features  # 512
+            res.fc         = nn.Identity()
+            self.backbone  = res
+            self.aux_head  = None
         elif bname == "resnet50":
             try:
                 res = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
@@ -427,7 +445,7 @@ class LabelPredictor(nn.Module):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _set_backbone_trainable(encoder: "ConceptEncoder", trainable: bool):
-    """Freeze or unfreeze InceptionV3 backbone weights."""
+    """Freeze or unfreeze backbone weights (ResNet18/ResNet50/InceptionV3)."""
     for param in encoder.backbone.parameters():
         param.requires_grad = trainable
 
@@ -453,6 +471,11 @@ def train_stage1(
     warmup = cfg["stage1_warmup_epochs"]
     early_stop_patience = cfg["stage1_early_stop"]
 
+    # Get backbone-specific LR
+    backbone_name = encoder._backbone_type
+    stage1_lr_dict = cfg["stage1_lr"]
+    base_lr = stage1_lr_dict.get(backbone_name, 0.01)  # default to 0.01 if unknown
+
     # Weighted BCE — addresses concept class imbalance
     train_ds = train_loader.dataset
     pos_weight = torch.tensor(
@@ -465,10 +488,11 @@ def train_stage1(
 
     # Phase A: freeze backbone, only optimise heads
     print(f"  [Phase A] Freezing backbone for {warmup} warmup epochs ...")
+    print(f"  Using LR={base_lr} for {backbone_name}")
     _set_backbone_trainable(encoder, False)
     optimizer = torch.optim.SGD(
         filter(lambda p: p.requires_grad, encoder.parameters()),
-        lr=cfg["stage1_lr"],
+        lr=base_lr,
         momentum=cfg["stage1_momentum"],
         weight_decay=cfg["stage1_wd"],
     )
@@ -492,7 +516,7 @@ def train_stage1(
             _set_backbone_trainable(encoder, True)
             optimizer = torch.optim.SGD(
                 encoder.parameters(),
-                lr=cfg["stage1_lr"] * 0.1,   # lower LR when unfreezing
+                lr=base_lr * 0.1,   # lower LR when unfreezing
                 momentum=cfg["stage1_momentum"],
                 weight_decay=cfg["stage1_wd"],
             )
@@ -561,10 +585,25 @@ def train_stage1(
               f"train={train_loss:.4f}  val={val_loss:.4f}  lr={current_lr:.2e}")
 
         # ── Checkpoint + early stopping
+        # Save best model with metadata
+        current_phase = "A" if epoch < warmup else "B"
         if val_loss < best_loss:
             best_loss  = val_loss
             no_improve = 0
-            torch.save(encoder.state_dict(), save_path)
+            torch.save({
+                "epoch": epoch + 1,
+                "encoder_state_dict": encoder.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "best_loss": best_loss,
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "current_lr": current_lr,
+                "phase": current_phase,
+                "phase_b_done": phase_b_done,
+                "backbone": backbone_name,
+                "base_lr": base_lr,
+            }, save_path)
         else:
             no_improve += 1
             if no_improve >= early_stop_patience and epoch >= warmup:
@@ -572,7 +611,34 @@ def train_stage1(
                       f"(no improvement for {early_stop_patience} epochs)")
                 break
 
-    encoder.load_state_dict(torch.load(save_path, map_location=device))
+        # Save periodic checkpoint (for resuming or inspection)
+        save_freq = cfg.get("save_freq", 5)
+        if (epoch + 1) % save_freq == 0:
+            epoch_path = os.path.join(cfg["checkpoint_dir"], f"encoder_epoch_{epoch+1}.pth")
+            torch.save({
+                "epoch": epoch + 1,
+                "encoder_state_dict": encoder.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "best_loss": best_loss,
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "current_lr": current_lr,
+                "phase": current_phase,
+                "phase_b_done": phase_b_done,
+                "no_improve": no_improve,
+                "backbone": backbone_name,
+                "base_lr": base_lr,
+                "warmup_epochs": warmup,
+            }, epoch_path)
+            print(f"  Checkpoint saved: {epoch_path} (phase {current_phase}, lr={current_lr:.2e})")
+
+    # Load best checkpoint (handle both old and new format)
+    best_ckpt = torch.load(save_path, map_location=device)
+    if isinstance(best_ckpt, dict):
+        encoder.load_state_dict(best_ckpt["encoder_state_dict"])
+    else:
+        encoder.load_state_dict(best_ckpt)
     print(f"Stage 1 done. Best val loss: {best_loss:.4f}")
     return encoder
 
@@ -663,8 +729,13 @@ def train_stage2(
 
     save_path    = os.path.join(cfg["checkpoint_dir"], "predictor_best.pth")
     best_val_acc = 0.0
+    save_freq = cfg.get("save_freq", 5)
 
-    for epoch in tqdm(range(cfg["stage2_epochs"]), desc="Stage2", leave=False):
+    print(f"  Stage2 training: {len(c_tr)} train samples, {len(c_vl)} val samples")
+    print(f"  Train classes: {len(torch.unique(y_tr))}, Val classes: {len(torch.unique(y_vl))}")
+    print(f"  Train/Val class overlap: {len(set(y_tr.cpu().numpy()) & set(y_vl.cpu().numpy()))}")
+
+    for epoch in range(cfg["stage2_epochs"]):
         predictor.train()
         optimizer.zero_grad()
         loss = criterion(predictor(c_tr), y_tr)
@@ -674,13 +745,47 @@ def train_stage2(
         predictor.eval()
         with torch.no_grad():
             val_acc = (predictor(c_vl).argmax(1) == y_vl).float().mean().item()
+        current_lr = optimizer.param_groups[0]["lr"]
         scheduler.step(val_acc)
+
+        # Print progress every few epochs
+        if epoch % 10 == 0 or epoch < 3:
+            print(f"  Epoch {epoch+1}/{cfg['stage2_epochs']}: loss={loss.item():.4f}, val_acc={val_acc:.4f}, lr={current_lr:.2e}, best={best_val_acc:.4f}")
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            torch.save(predictor.state_dict(), save_path)
+            torch.save({
+                "epoch": epoch + 1,
+                "predictor_state_dict": predictor.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "best_val_acc": best_val_acc,
+                "train_loss": loss.item(),
+                "val_acc": val_acc,
+                "current_lr": current_lr,
+            }, save_path)
 
-    predictor.load_state_dict(torch.load(save_path, map_location=device))
+        # Save periodic checkpoint
+        if (epoch + 1) % save_freq == 0:
+            epoch_path = os.path.join(cfg["checkpoint_dir"], f"predictor_epoch_{epoch+1}.pth")
+            torch.save({
+                "epoch": epoch + 1,
+                "predictor_state_dict": predictor.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "best_val_acc": best_val_acc,
+                "train_loss": loss.item(),
+                "val_acc": val_acc,
+                "current_lr": current_lr,
+            }, epoch_path)
+            print(f"  Stage2 checkpoint: {epoch_path} (val_acc={val_acc:.4f}, lr={current_lr:.2e})")
+
+    # Load best checkpoint
+    best_ckpt = torch.load(save_path, map_location=device)
+    if isinstance(best_ckpt, dict):
+        predictor.load_state_dict(best_ckpt["predictor_state_dict"])
+    else:
+        predictor.load_state_dict(best_ckpt)
     print(f"Stage 2 done. Best val accuracy: {best_val_acc:.4f}")
     return predictor
 
@@ -786,6 +891,54 @@ def save_bq_artifacts(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Resume from checkpoint
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_encoder_checkpoint(encoder: ConceptEncoder, checkpoint_path: str, device: str):
+    """
+    Load encoder from a checkpoint. Returns checkpoint info dict.
+
+    Checkpoint contains:
+        - epoch, best_loss, train_loss, val_loss
+        - phase, phase_b_done, no_improve
+        - backbone, base_lr, warmup_epochs
+        - optimizer_state_dict, scheduler_state_dict
+    """
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    if isinstance(ckpt, dict):  # Full checkpoint with metadata
+        encoder.load_state_dict(ckpt["encoder_state_dict"])
+        print(f"Resumed from epoch {ckpt['epoch']} (phase {ckpt.get('phase', '?')})")
+        print(f"  best_loss={ckpt.get('best_loss', 'N/A'):.4f}, "
+              f"train={ckpt.get('train_loss', 'N/A'):.4f}, val={ckpt.get('val_loss', 'N/A'):.4f}")
+        print(f"  lr={ckpt.get('current_lr', 'N/A'):.2e}, backbone={ckpt.get('backbone', 'N/A')}")
+        return ckpt
+    else:  # State dict only (old format)
+        encoder.load_state_dict(ckpt)
+        print(f"Loaded encoder weights from {checkpoint_path}")
+        return {}
+
+
+def inspect_checkpoint(checkpoint_path: str, device: str = "cpu"):
+    """Print checkpoint info without loading into model."""
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    print(f"\nCheckpoint: {checkpoint_path}")
+    print("-" * 50)
+    if isinstance(ckpt, dict):
+        for key in sorted(ckpt.keys()):
+            if key.endswith("_state_dict"):
+                continue  # Skip large state dicts
+            elif key == "encoder_state_dict":
+                print(f"  encoder_state_dict: <model weights>")
+            elif key == "predictor_state_dict":
+                print(f"  predictor_state_dict: <model weights>")
+            else:
+                print(f"  {key}: {ckpt[key]}")
+    else:
+        print("  (state dict only - no metadata)")
+    print("-" * 50)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -794,7 +947,91 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", choices=["cuda", "mps", "cpu"], help="Force compute device")
     parser.add_argument("--gpu", action="store_true", help="Shortcut for --device cuda")
+    parser.add_argument("--resume", type=str, help="Path to checkpoint to resume from")
+    parser.add_argument("--save-freq", type=int, default=CFG.get("save_freq", 5),
+                        help="Save checkpoint every N epochs")
+    parser.add_argument("--inspect", type=str, help="Inspect checkpoint file and exit")
+    parser.add_argument("--stage2-only", action="store_true", help="Skip Stage 1, load encoder and run Stage 2 only")
     args = parser.parse_args()
+
+    # Update config with CLI args
+    if args.save_freq:
+        CFG["save_freq"] = args.save_freq
+
+    # Just inspect checkpoint?
+    if args.inspect:
+        inspect_checkpoint(args.inspect, CFG["device"])
+        return
+
+    # Stage 2 only mode: load encoder and train predictor
+    if args.stage2_only:
+        print("\n=== Stage 2 Only Mode ===")
+        print("Loading encoder from checkpoint...")
+
+        # Load concept names
+        concept_names = get_concept_names()
+        encoder = ConceptEncoder(concept_names)
+
+        # Try to load encoder checkpoint
+        encoder_path = os.path.join(CFG["checkpoint_dir"], "encoder_best.pth")
+        if not os.path.exists(encoder_path):
+            print(f"Error: Encoder checkpoint not found at {encoder_path}")
+            print("Run full training first to generate encoder checkpoint.")
+            return
+
+        ckpt = torch.load(encoder_path, map_location=CFG["device"])
+        if isinstance(ckpt, dict):
+            # Check if it's new format with metadata or old state_dict
+            if "encoder_state_dict" in ckpt:
+                encoder.load_state_dict(ckpt["encoder_state_dict"])
+            else:
+                # Old format - state_dict with keys like 'backbone.conv1.weight'
+                encoder.load_state_dict(ckpt)
+        else:
+            encoder.load_state_dict(ckpt)
+        encoder = encoder.to(CFG["device"])
+        encoder.eval()
+        print("Encoder loaded.")
+
+        # Load data
+        import functools
+        path_transform = functools.partial(fix_cub_image_path, cub_root=CFG["cub_dir"])
+        train_ds = CUBDataset(split="train", root=CFG["cub_dir"], path_transform=path_transform,
+                              selected_concepts=SELECTED_CONCEPTS)
+        val_ds   = CUBDataset(split="val",   root=CFG["cub_dir"], path_transform=path_transform,
+                              selected_concepts=SELECTED_CONCEPTS)
+        test_ds  = CUBDataset(split="test",  root=CFG["cub_dir"], path_transform=path_transform,
+                              selected_concepts=SELECTED_CONCEPTS)
+
+        _pin = CFG["device"] == "cuda"
+        _persist = CFG["num_workers"] > 0
+        train_loader = DataLoader(train_ds, batch_size=CFG["batch_size"], shuffle=True,
+                                  num_workers=CFG["num_workers"], pin_memory=_pin,
+                                  persistent_workers=_persist)
+        val_loader = DataLoader(val_ds, batch_size=CFG["batch_size"], shuffle=False,
+                                num_workers=CFG["num_workers"], pin_memory=_pin,
+                                persistent_workers=_persist)
+
+        # Extract concept scores
+        print("Extracting concept scores...")
+        c_train, y_train = extract_concept_scores(encoder, train_loader, CFG["device"])
+        c_val,   y_val   = extract_concept_scores(encoder, val_loader,   CFG["device"])
+        c_test,  y_test  = extract_concept_scores(encoder, val_loader, CFG["device"])  # Use val as test for quick check
+
+        print(f"  train: {c_train.shape}, val: {c_val.shape}")
+
+        # Train Stage 2
+        print("\n=== Stage 2: label predictor (c → y) ===")
+        predictor = LabelPredictor(CFG["n_concepts"], CFG["n_classes"])
+        predictor = train_stage2(predictor, c_train, y_train, c_val, y_val, CFG)
+
+        # Evaluate on test
+        task_acc = evaluate_task_accuracy(predictor, c_test, y_test, CFG["device"])
+        print(f"Test task accuracy: {task_acc:.4f}")
+
+        # Save final artifacts
+        save_bq_artifacts(encoder, predictor, c_test, y_test, CFG)
+        return
 
     # Resolve device preference
     auto_device = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
@@ -825,6 +1062,12 @@ def main():
             pass
 
     print(f"Backbone: {CFG['backbone']}  | Input size: {CFG['input_size']}  | Device: {CFG['device']}")
+
+    # Show model size for awareness
+    if CFG['backbone'] == 'resnet18':
+        print("Note: Using ResNet18 (light) ~11M params for fast training")
+    elif CFG['backbone'] == 'resnet50':
+        print("Note: Using ResNet50 ~25M params")
 
     # ── Concept names (112, ordered to match pkl attribute_label vectors)
     concept_names = get_concept_names()
@@ -866,8 +1109,11 @@ def main():
 
     # ── Stage 1: train x → c
     print("\n=== Stage 1: concept encoder (x → c) ===")
-    encoder  = ConceptEncoder(concept_names)
-    encoder  = train_stage1(encoder, train_loader, val_loader, CFG)
+    encoder = ConceptEncoder(concept_names)
+    if args.resume:
+        print(f"Resuming from checkpoint: {args.resume}")
+        load_encoder_checkpoint(encoder, args.resume, CFG["device"])
+    encoder = train_stage1(encoder, train_loader, val_loader, CFG)
 
     concept_acc = evaluate_concept_accuracy(encoder, val_loader, CFG["device"])
     print(f"Stage 1 val concept accuracy: {concept_acc:.4f}  "
